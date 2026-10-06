@@ -1,0 +1,15 @@
+name = "opencode"
+version = "0.1.0"
+protocol = 1
+description = "OpenCode terminal coding agent"
+permissions = ["exec:opencode"]
+
+[[provides.agent]]
+id = "opencode"
+display_name = "OpenCode"
+binary = "opencode"
+launch = "static"
+settings = ["args"]
+reserved_args = ["--prompt", "--prompt="]
+start = ["{binary}", "{args...}"]
+prompt = ["--prompt", "{prompt}"]

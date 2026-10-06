@@ -1,0 +1,13 @@
+{
+  "format": 1,
+  "name": "asterism-dev",
+  "description": "Official asterism plugins",
+  "plugins": [
+    {
+      "name": "opencode",
+      "path": "plugins/opencode",
+      "description": "OpenCode terminal coding agent",
+      "tags": ["agent"]
+    }
+  ]
+}
