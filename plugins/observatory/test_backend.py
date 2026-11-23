@@ -26,6 +26,16 @@ VMS = {"vms": [
 ]}
 IMAGES = [{"ref": "observatory/standard"}]
 
+# Runs backend.py with the SSH target and wait patched, so tests need no DNS and no 300 s waits.
+BOOT = """import os, sys
+sys.path.insert(0, %r)
+import backend
+if "TEST_SSH_PORT" in os.environ:
+    backend.ssh_address = lambda name: ("127.0.0.1", int(os.environ["TEST_SSH_PORT"]))
+backend.SSH_WAIT_SECONDS = float(os.environ.get("TEST_SSH_WAIT", backend.SSH_WAIT_SECONDS))
+backend.main()
+""" % HERE
+
 
 class Backend:
     def __init__(self, env=None, settings=None, with_cli=True):
@@ -44,7 +54,7 @@ class Backend:
         }
         full_env.update(env or {})
         self.proc = subprocess.Popen(
-            ["/usr/bin/env", "python3", os.path.join(HERE, "backend.py")],
+            ["/usr/bin/env", "python3", "-c", BOOT],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=full_env,
         )
         self.next_id = 0
@@ -78,7 +88,7 @@ class BackendTest(unittest.TestCase):
         s.bind(("127.0.0.1", 0))
         s.listen()
         self.addCleanup(s.close)
-        return {"OBSERVATORY_PLUGIN_SSH_ADDR": "127.0.0.1:%d" % s.getsockname()[1]}
+        return {"TEST_SSH_PORT": str(s.getsockname()[1])}
 
     def test_initialize(self):
         b = self.start()
@@ -115,7 +125,7 @@ class BackendTest(unittest.TestCase):
         result = b.call("machine_provider.create", {"provider": "observatory", "name": "api", "options": options})["result"]
         self.assertEqual(result, {"ref": "vm-1", "name": "api", "destination": "dev@api.internal"})
         self.assertEqual(b.argv()[-1], ["vm", "create", "api", "--cpus", "2", "--memory", "4G", "--disk", "20",
-                                        "--image", "observatory/standard", "--wait", "--json"])
+                                        "--image", "observatory/standard", "--wait", "--timeout", "10m", "--json"])
 
     def test_create_default_image(self):
         env = {"FAKE_OUT_vm_create": json.dumps({"id": "vm-1", "name": "api"}), **self.ssh_listener()}
@@ -128,17 +138,17 @@ class BackendTest(unittest.TestCase):
         b = self.start(env=env)
         result = b.call("machine_provider.resume", {"provider": "observatory", "ref": "vm-1"})["result"]
         self.assertEqual(result, {"destination": "dev@api.internal"})
-        self.assertEqual(b.argv()[-1], ["vm", "start", "vm-1", "--wait", "--json"])
+        self.assertEqual(b.argv()[-1], ["vm", "start", "vm-1", "--wait", "--timeout", "10m", "--json"])
 
     def test_hibernate(self):
         b = self.start()
         self.assertIsNone(b.call("machine_provider.hibernate", {"ref": "vm-1"})["result"])
-        self.assertEqual(b.argv()[-1], ["vm", "hibernate", "vm-1", "--wait", "--json"])
+        self.assertEqual(b.argv()[-1], ["vm", "hibernate", "vm-1", "--wait", "--timeout", "10m", "--json"])
 
     def test_delete_argv(self):
         b = self.start()
         self.assertIsNone(b.call("machine_provider.delete", {"ref": "vm-1"})["result"])
-        self.assertEqual(b.argv()[-1], ["vm", "delete", "vm-1", "--yes", "--wait", "--json"])
+        self.assertEqual(b.argv()[-1], ["vm", "delete", "vm-1", "--yes", "--wait", "--timeout", "10m", "--json"])
 
     def test_delete_not_found(self):
         b = self.start(env={"FAKE_EXIT_vm_delete": "5"})
@@ -162,9 +172,8 @@ class BackendTest(unittest.TestCase):
         b.proc.stdin = open(os.devnull, "w")
 
     def test_unexpected_error_is_answered(self):
-        b = self.start()
-        error = b.call("machine_provider.create", {"name": "api", "options": {"cpus": None, "memory_gb": 1, "disk_gb": 1}})["error"]
-        self.assertEqual(error["data"]["kind"], "plugin_error")
+        b = self.start(env={"FAKE_OUT_vm_list": "not json"})
+        self.assertEqual(b.call("machine_provider.list", {})["error"]["data"]["kind"], "plugin_error")
 
     def test_malformed_line_is_skipped(self):
         b = self.start()
@@ -181,7 +190,31 @@ class BackendTest(unittest.TestCase):
         b = self.start(env={"FAKE_EXIT_vm_create": "6"})
         error = b.call("machine_provider.create", {"name": "api", "options": {"cpus": 1, "memory_gb": 1, "disk_gb": 1}})["error"]
         self.assertEqual(error["data"]["kind"], "timeout")
-        self.assertEqual(b.argv()[-1], ["vm", "delete", "api", "--yes", "--wait", "--json"])
+        self.assertEqual(b.argv()[-1], ["vm", "delete", "api", "--yes", "--wait", "--timeout", "10m", "--json"])
+
+    def test_cli_error_uses_last_message_line(self):
+        err = "A new release v0.23.0 is available, run observatory update\nobservatory: session expired or revoked, run observatory login\n"
+        error = self.start(env={"FAKE_EXIT_vm_hibernate": "3", "FAKE_ERR_vm_hibernate": err}).call("machine_provider.hibernate", {"ref": "vm-1"})["error"]
+        self.assertEqual(error["message"], "session expired or revoked, run observatory login")
+
+    def test_fractional_size_rejected(self):
+        b = self.start()
+        error = b.call("machine_provider.create", {"name": "api", "options": {"cpus": 1, "memory_gb": 0.5, "disk_gb": 10}})["error"]
+        self.assertEqual(error["data"]["kind"], "invalid_params")
+        self.assertIn("memory_gb", error["message"])
+        self.assertFalse(os.path.exists(b.log))
+
+    def test_ssh_timeout_hints_wireguard_and_deletes_vm(self):
+        closed = socket.socket()
+        closed.bind(("127.0.0.1", 0))
+        port = closed.getsockname()[1]
+        closed.close()
+        env = {"FAKE_OUT_vm_create": json.dumps({"id": "vm-1", "name": "api"}), "TEST_SSH_PORT": str(port), "TEST_SSH_WAIT": "0"}
+        b = self.start(env=env)
+        error = b.call("machine_provider.create", {"name": "api", "options": {"cpus": 1, "memory_gb": 1, "disk_gb": 1}})["error"]
+        self.assertEqual(error["data"]["kind"], "timeout")
+        self.assertIn("WireGuard", error["message"])
+        self.assertEqual(b.argv()[-1][:3], ["vm", "delete", "api"])
 
     def test_cli_missing(self):
         b = self.start(with_cli=False)

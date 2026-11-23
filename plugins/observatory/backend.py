@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Asterism machine provider backend for Observatory, wrapping the `observatory` CLI."""
 import json
-import os
 import socket
 import subprocess
 import sys
@@ -12,6 +11,8 @@ DEFAULTS = {"image": "", "cpus": 2, "memory_gb": 4, "disk_gb": 20}
 STATES = {"running": "running", "suspended": "running", "stopped": "stopped", "paused": "stopped", "hibernated": "hibernated"}
 KIND_CODES = {"invalid_params": -32602, "not_found": -32001, "timeout": -32007}
 SSH_WAIT_SECONDS = 300
+# the CLI's own default of 5m can be too short when a node first pulls an image
+WAIT = ["--wait", "--timeout", "10m"]
 settings = dict(DEFAULTS)
 out_lock = threading.Lock()
 
@@ -25,12 +26,14 @@ class RpcError(Exception):
 
 def run_cli(args):
     try:
-        proc = subprocess.run(["observatory", *args, "--json"], capture_output=True, text=True)
+        proc = subprocess.run(["observatory", *args, "--json"], stdin=subprocess.DEVNULL, capture_output=True, text=True)
     except FileNotFoundError:
         raise RpcError("plugin_error", "observatory CLI not found on PATH")
     if proc.returncode != 0:
         kind = {5: "not_found", 6: "timeout"}.get(proc.returncode, "plugin_error")
-        message = proc.stderr.strip().removeprefix("observatory: ") or "observatory exited with %d" % proc.returncode
+        # stderr also carries update hints and session warnings; the error is the "observatory: " line
+        errors = [line.removeprefix("observatory: ") for line in proc.stderr.splitlines() if line.startswith("observatory: ")]
+        message = errors[-1] if errors else proc.stderr.strip() or "observatory exited with %d" % proc.returncode
         raise RpcError(kind, message)
     return json.loads(proc.stdout) if proc.stdout.strip() else None
 
@@ -76,27 +79,38 @@ def list_vms(params):
     return {"vms": vms, "create_options": create_options}
 
 
+def ssh_address(name):
+    return "%s.internal" % name, 22
+
+
 def wait_for_ssh(name):
-    host, port = os.environ.get("OBSERVATORY_PLUGIN_SSH_ADDR", "%s.internal:22" % name).rsplit(":", 1)
+    host, port = ssh_address(name)
     deadline = time.monotonic() + SSH_WAIT_SECONDS
     while True:
         try:
-            socket.create_connection((host, int(port)), timeout=2).close()
+            socket.create_connection((host, port), timeout=2).close()
             return
         except OSError:
             if time.monotonic() >= deadline:
-                raise RpcError("timeout", "VM %s did not accept SSH within %d s" % (name, SSH_WAIT_SECONDS))
+                raise RpcError("timeout", "VM %s did not accept SSH within %d s; is your WireGuard device up?" % (name, SSH_WAIT_SECONDS))
             time.sleep(2)
+
+
+def whole_number(options, key):
+    value = options[key]
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != int(value) or value < 1:
+        raise RpcError("invalid_params", "%s must be a whole number of at least 1, got %r" % (key, value))
+    return int(value)
 
 
 def create(params):
     name, options = params["name"], params.get("options") or {}
-    args = ["vm", "create", name, "--cpus", str(int(options["cpus"])), "--memory", "%dG" % int(options["memory_gb"]),
-            "--disk", str(int(options["disk_gb"]))]
+    args = ["vm", "create", name, "--cpus", str(whole_number(options, "cpus")),
+            "--memory", "%dG" % whole_number(options, "memory_gb"), "--disk", str(whole_number(options, "disk_gb"))]
     if options.get("image", "default") != "default":
         args += ["--image", options["image"]]
     try:
-        vm = run_cli(args + ["--wait"])
+        vm = run_cli(args + WAIT)
         wait_for_ssh(vm["name"])
     except RpcError as e:
         # a timeout means the VM exists but Asterism never gets its ref, so it would be left behind
@@ -107,19 +121,19 @@ def create(params):
 
 
 def resume(params):
-    vm = run_cli(["vm", "start", params["ref"], "--wait"])
+    vm = run_cli(["vm", "start", params["ref"], *WAIT])
     wait_for_ssh(vm["name"])
     return {"destination": destination(vm["name"])}
 
 
 def hibernate(params):
-    run_cli(["vm", "hibernate", params["ref"], "--wait"])
+    run_cli(["vm", "hibernate", params["ref"], *WAIT])
     return None
 
 
 def delete(params):
     try:
-        run_cli(["vm", "delete", params["ref"], "--yes", "--wait"])
+        run_cli(["vm", "delete", params["ref"], "--yes", *WAIT])
     except RpcError as e:
         if e.kind != "not_found":
             raise
