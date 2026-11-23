@@ -153,7 +153,7 @@ def main():
     for line in sys.stdin:
         if line.strip():
             # create and resume run for minutes; the daemon may call list meanwhile
-            threading.Thread(target=handle, args=(json.loads(line),), daemon=True).start()
+            threading.Thread(target=handle, args=(json.loads(line),)).start()
 
 
 if __name__ == "__main__":

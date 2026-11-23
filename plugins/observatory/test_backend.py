@@ -154,6 +154,13 @@ class BackendTest(unittest.TestCase):
         error = self.start(env={"FAKE_EXIT_vm_start": "6"}).call("machine_provider.resume", {"ref": "vm-1"})["error"]
         self.assertEqual(error["data"]["kind"], "timeout")
 
+    def test_answers_after_stdin_closed(self):
+        b = self.start()
+        b.proc.stdin.write(json.dumps({"jsonrpc": "2.0", "id": 99, "method": "machine_provider.list", "params": {}}) + "\n")
+        b.proc.stdin.close()
+        self.assertEqual(json.loads(b.proc.stdout.readline())["id"], 99)
+        b.proc.stdin = open(os.devnull, "w")
+
     def test_cli_missing(self):
         b = self.start(with_cli=False)
         error = b.call("machine_provider.list", {})["error"]
