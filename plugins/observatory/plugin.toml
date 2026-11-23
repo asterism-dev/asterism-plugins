@@ -1,0 +1,37 @@
+name = "observatory"
+version = "0.1.0"
+protocol = 1
+description = "Observatory VMs as machines"
+permissions = ["exec:observatory", "network"]
+
+[backend]
+command = ["./backend.py"]
+
+[[provides.machine_provider]]
+id = "observatory"
+display_name = "Observatory"
+
+[[settings]]
+key = "image"
+title = "Default image"
+type = "string"
+description = "Image ref for new VMs; empty uses your default image"
+default = ""
+
+[[settings]]
+key = "cpus"
+title = "Default CPUs"
+type = "number"
+default = 2
+
+[[settings]]
+key = "memory_gb"
+title = "Default RAM (GB)"
+type = "number"
+default = 4
+
+[[settings]]
+key = "disk_gb"
+title = "Default disk (GB)"
+type = "number"
+default = 20
