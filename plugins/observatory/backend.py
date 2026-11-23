@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 """Asterism machine provider backend for Observatory, wrapping the `observatory` CLI."""
 import json
+import os
+import socket
 import subprocess
 import sys
+import threading
+import time
 
 DEFAULTS = {"image": "", "cpus": 2, "memory_gb": 4, "disk_gb": 20}
 STATES = {"running": "running", "suspended": "running", "stopped": "stopped", "paused": "stopped", "hibernated": "hibernated"}
 KIND_CODES = {"invalid_params": -32602, "not_found": -32001, "timeout": -32007}
+SSH_WAIT_SECONDS = 300
 settings = dict(DEFAULTS)
+out_lock = threading.Lock()
 
 
 class RpcError(Exception):
@@ -68,16 +74,65 @@ def list_vms(params):
     return {"vms": vms, "create_options": create_options}
 
 
+def wait_for_ssh(name):
+    host, port = os.environ.get("OBSERVATORY_PLUGIN_SSH_ADDR", "%s.internal:22" % name).rsplit(":", 1)
+    deadline = time.monotonic() + SSH_WAIT_SECONDS
+    while True:
+        try:
+            socket.create_connection((host, int(port)), timeout=2).close()
+            return
+        except OSError:
+            if time.monotonic() >= deadline:
+                raise RpcError("timeout", "VM %s did not accept SSH within %d s" % (name, SSH_WAIT_SECONDS))
+            time.sleep(2)
+
+
+def create(params):
+    name, options = params["name"], params.get("options") or {}
+    args = ["vm", "create", name, "--cpus", str(int(options["cpus"])), "--memory", "%dG" % int(options["memory_gb"]),
+            "--disk", str(int(options["disk_gb"]))]
+    if options.get("image", "default") != "default":
+        args += ["--image", options["image"]]
+    vm = run_cli(args + ["--wait"])
+    wait_for_ssh(vm["name"])
+    return {"ref": vm["id"], "name": vm["name"], "destination": destination(vm["name"])}
+
+
+def resume(params):
+    vm = run_cli(["vm", "start", params["ref"], "--wait"])
+    wait_for_ssh(vm["name"])
+    return {"destination": destination(vm["name"])}
+
+
+def hibernate(params):
+    run_cli(["vm", "hibernate", params["ref"], "--wait"])
+    return None
+
+
+def delete(params):
+    try:
+        run_cli(["vm", "delete", params["ref"], "--yes", "--wait"])
+    except RpcError as e:
+        if e.kind != "not_found":
+            raise
+    return None
+
+
 METHODS = {
     "initialize": initialize,
     "settings.changed": settings_changed,
     "machine_provider.list": list_vms,
+    "machine_provider.create": create,
+    "machine_provider.resume": resume,
+    "machine_provider.hibernate": hibernate,
+    "machine_provider.delete": delete,
 }
 
 
 def send(message):
-    sys.stdout.write(json.dumps(message) + "\n")
-    sys.stdout.flush()
+    with out_lock:
+        sys.stdout.write(json.dumps(message) + "\n")
+        sys.stdout.flush()
 
 
 def handle(request):
@@ -90,12 +145,15 @@ def handle(request):
         send({"jsonrpc": "2.0", "id": rid, "result": method(request.get("params") or {})})
     except RpcError as e:
         send({"jsonrpc": "2.0", "id": rid, "error": {"code": KIND_CODES.get(e.kind, -32000), "message": e.message, "data": {"kind": e.kind}}})
+    except KeyError as e:
+        send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "missing %s" % e, "data": {"kind": "invalid_params"}}})
 
 
 def main():
     for line in sys.stdin:
         if line.strip():
-            handle(json.loads(line))
+            # create and resume run for minutes; the daemon may call list meanwhile
+            threading.Thread(target=handle, args=(json.loads(line),), daemon=True).start()
 
 
 if __name__ == "__main__":

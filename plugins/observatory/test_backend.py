@@ -108,6 +108,52 @@ class BackendTest(unittest.TestCase):
         self.assertEqual(b.call("nope")["error"]["code"], -32601)
         self.assertIn("result", b.call("initialize", {}))
 
+    def test_create_argv(self):
+        env = {"FAKE_OUT_vm_create": json.dumps({"id": "vm-1", "name": "api"}), **self.ssh_listener()}
+        b = self.start(env=env)
+        options = {"image": "observatory/standard", "cpus": 2.0, "memory_gb": 4, "disk_gb": 20}
+        result = b.call("machine_provider.create", {"provider": "observatory", "name": "api", "options": options})["result"]
+        self.assertEqual(result, {"ref": "vm-1", "name": "api", "destination": "dev@api.internal"})
+        self.assertEqual(b.argv()[-1], ["vm", "create", "api", "--cpus", "2", "--memory", "4G", "--disk", "20",
+                                        "--image", "observatory/standard", "--wait", "--json"])
+
+    def test_create_default_image(self):
+        env = {"FAKE_OUT_vm_create": json.dumps({"id": "vm-1", "name": "api"}), **self.ssh_listener()}
+        b = self.start(env=env)
+        b.call("machine_provider.create", {"name": "api", "options": {"image": "default", "cpus": 1, "memory_gb": 1, "disk_gb": 10}})
+        self.assertNotIn("--image", b.argv()[-1])
+
+    def test_resume(self):
+        env = {"FAKE_OUT_vm_start": json.dumps({"id": "vm-1", "name": "api"}), **self.ssh_listener()}
+        b = self.start(env=env)
+        result = b.call("machine_provider.resume", {"provider": "observatory", "ref": "vm-1"})["result"]
+        self.assertEqual(result, {"destination": "dev@api.internal"})
+        self.assertEqual(b.argv()[-1], ["vm", "start", "vm-1", "--wait", "--json"])
+
+    def test_hibernate(self):
+        b = self.start()
+        self.assertIsNone(b.call("machine_provider.hibernate", {"ref": "vm-1"})["result"])
+        self.assertEqual(b.argv()[-1], ["vm", "hibernate", "vm-1", "--wait", "--json"])
+
+    def test_delete_argv(self):
+        b = self.start()
+        self.assertIsNone(b.call("machine_provider.delete", {"ref": "vm-1"})["result"])
+        self.assertEqual(b.argv()[-1], ["vm", "delete", "vm-1", "--yes", "--wait", "--json"])
+
+    def test_delete_not_found(self):
+        b = self.start(env={"FAKE_EXIT_vm_delete": "5"})
+        self.assertIsNone(b.call("machine_provider.delete", {"ref": "vm-1"})["result"])
+
+    def test_cli_error_message(self):
+        env = {"FAKE_EXIT_vm_hibernate": "3", "FAKE_ERR_vm_hibernate": "observatory: session expired or revoked, run observatory login\n"}
+        error = self.start(env=env).call("machine_provider.hibernate", {"ref": "vm-1"})["error"]
+        self.assertEqual(error["data"]["kind"], "plugin_error")
+        self.assertIn("run observatory login", error["message"])
+
+    def test_wait_timeout(self):
+        error = self.start(env={"FAKE_EXIT_vm_start": "6"}).call("machine_provider.resume", {"ref": "vm-1"})["error"]
+        self.assertEqual(error["data"]["kind"], "timeout")
+
     def test_cli_missing(self):
         b = self.start(with_cli=False)
         error = b.call("machine_provider.list", {})["error"]
