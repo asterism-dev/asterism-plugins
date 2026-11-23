@@ -65,6 +65,8 @@ def list_vms(params):
         for vm in run_cli(["vm", "list"])["vms"]
     ]
     images = ["default"] + [image["ref"] for image in run_cli(["image", "list"])]
+    if settings["image"] and settings["image"] not in images:
+        images.append(settings["image"])
     create_options = [
         {"key": "image", "title": "Image", "type": "enum", "required": True, "options": images, "default": settings["image"] or "default"},
         number_option("cpus", "CPUs"),
@@ -93,8 +95,14 @@ def create(params):
             "--disk", str(int(options["disk_gb"]))]
     if options.get("image", "default") != "default":
         args += ["--image", options["image"]]
-    vm = run_cli(args + ["--wait"])
-    wait_for_ssh(vm["name"])
+    try:
+        vm = run_cli(args + ["--wait"])
+        wait_for_ssh(vm["name"])
+    except RpcError as e:
+        # a timeout means the VM exists but Asterism never gets its ref, so it would be left behind
+        if e.kind == "timeout":
+            delete({"ref": name})
+        raise
     return {"ref": vm["id"], "name": vm["name"], "destination": destination(vm["name"])}
 
 
@@ -147,13 +155,19 @@ def handle(request):
         send({"jsonrpc": "2.0", "id": rid, "error": {"code": KIND_CODES.get(e.kind, -32000), "message": e.message, "data": {"kind": e.kind}}})
     except KeyError as e:
         send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "missing %s" % e, "data": {"kind": "invalid_params"}}})
+    except Exception as e:
+        send({"jsonrpc": "2.0", "id": rid, "error": {"code": -32000, "message": str(e), "data": {"kind": "plugin_error"}}})
 
 
 def main():
     for line in sys.stdin:
-        if line.strip():
-            # create and resume run for minutes; the daemon may call list meanwhile
-            threading.Thread(target=handle, args=(json.loads(line),)).start()
+        try:
+            request = json.loads(line)
+        except ValueError:
+            print("ignoring malformed line: %r" % line, file=sys.stderr)
+            continue
+        # create and resume run for minutes; the daemon may call list meanwhile
+        threading.Thread(target=handle, args=(request,)).start()
 
 
 if __name__ == "__main__":

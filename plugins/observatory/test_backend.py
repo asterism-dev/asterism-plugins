@@ -161,6 +161,28 @@ class BackendTest(unittest.TestCase):
         self.assertEqual(json.loads(b.proc.stdout.readline())["id"], 99)
         b.proc.stdin = open(os.devnull, "w")
 
+    def test_unexpected_error_is_answered(self):
+        b = self.start()
+        error = b.call("machine_provider.create", {"name": "api", "options": {"cpus": None, "memory_gb": 1, "disk_gb": 1}})["error"]
+        self.assertEqual(error["data"]["kind"], "plugin_error")
+
+    def test_malformed_line_is_skipped(self):
+        b = self.start()
+        b.proc.stdin.write("not json\n")
+        self.assertIn("result", b.call("initialize", {}))
+
+    def test_image_setting_in_options(self):
+        b = self.start(settings={"image": "standard"})
+        image = b.call("machine_provider.list", {})["result"]["create_options"][0]
+        self.assertEqual(image["default"], "standard")
+        self.assertIn("standard", image["options"])
+
+    def test_create_timeout_deletes_vm(self):
+        b = self.start(env={"FAKE_EXIT_vm_create": "6"})
+        error = b.call("machine_provider.create", {"name": "api", "options": {"cpus": 1, "memory_gb": 1, "disk_gb": 1}})["error"]
+        self.assertEqual(error["data"]["kind"], "timeout")
+        self.assertEqual(b.argv()[-1], ["vm", "delete", "api", "--yes", "--wait", "--json"])
+
     def test_cli_missing(self):
         b = self.start(with_cli=False)
         error = b.call("machine_provider.list", {})["error"]
